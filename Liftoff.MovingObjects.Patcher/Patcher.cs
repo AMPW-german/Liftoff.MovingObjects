@@ -102,6 +102,13 @@ namespace Liftoff.MovingObjects.Patcher
             AddSerializableField(assembly, trackBlueprintType, "mo_triggerOptions", triggerType);
             AddSerializableField(assembly, trackBlueprintType, "mo_groupId",
                 assembly.MainModule.ImportReference(typeof(string)));
+
+#if DEBUG
+            string outputPath = @"C:\Users\AMPW\source\repos\Liftoff.MovingObjects\Assembly-CSharp.dll";
+            assembly.Write(outputPath);
+#endif
         }
+
+
     }
 }

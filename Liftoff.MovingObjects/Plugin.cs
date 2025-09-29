@@ -53,8 +53,9 @@ public sealed class Plugin : BaseUnityPlugin
 
     private void OnDestroy()
     {
-        _assetBundle.Unload(true);
-        _harmony?.UnpatchSelf();
+        Log.LogError($"Destroying Plugin, unpatching the dll");
+        //_assetBundle.Unload(true);
+        //_harmony?.UnpatchSelf();
     }
 
     [HarmonyPostfix]
