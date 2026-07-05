@@ -1,10 +1,14 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Reflection;
+using System.Threading;
 using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
 using Liftoff.MovingObjects.Player;
 using Liftoff.MovingObjects.Utils;
+using Liftoff.Multiplayer;
 using UnityEngine;
 using UnityEngine.UIElements;
 
@@ -19,12 +23,17 @@ public sealed class Plugin : BaseUnityPlugin
     private static AssetBundle _assetBundle;
     private static AnimationEditorWindow.Assets _editorAssets;
     private static PlacementUtilsWindow.Assets _placementAssets;
+    private const string SpectatorAttachMarker = "Attached spectator camera to";
+    private static int _spectatorAttachTraceHits;
 
     private Harmony _harmony;
 
     private void Awake()
     {
         Log.LogInfo($"{PluginInfo.PLUGIN_NAME} {PluginInfo.PLUGIN_VERSION} loaded");
+
+        Application.logMessageReceivedThreaded += OnUnityLogMessageReceivedThreaded;
+        Log.LogInfo("SpectatorAttachTrace: subscribed to Application.logMessageReceivedThreaded");
 
         try { DontDestroyOnLoad(gameObject); }
         catch (System.Exception ex) { Log.LogWarning($"DontDestroyOnLoad failed: {ex.Message}"); }
@@ -73,6 +82,11 @@ public sealed class Plugin : BaseUnityPlugin
         // and asset bundle at that point silently disabled the entire mod for the rest
         // of the session. The patches are static and continue functioning without us;
         // the asset bundle is referenced by editor windows attached on demand.
+    }
+
+    private static void OnUnityLogMessageReceivedThreaded(string condition, string stackTrace, LogType type)
+    {
+        TryLogSpectatorAttachTrace("Application.logMessageReceivedThreaded", type, condition, stackTrace);
     }
 
     [HarmonyPostfix]
@@ -154,6 +168,139 @@ public sealed class Plugin : BaseUnityPlugin
             Quaternion.Euler(GridUtils.SmartRound(rot));
     }
 
+    [HarmonyPatch]
+    private static class SpectatorAttachLogCallbackPatch
+    {
+        [HarmonyTargetMethods]
+        private static IEnumerable<MethodBase> TargetMethods()
+        {
+            var anyTarget = false;
+
+            var debugLogHandlerType = AccessTools.TypeByName("UnityEngine.DebugLogHandler");
+            if (debugLogHandlerType != null)
+            {
+                var debugLogFormat = AccessTools.DeclaredMethod(debugLogHandlerType,
+                    "LogFormat",
+                    new[] { typeof(LogType), typeof(UnityEngine.Object), typeof(string), typeof(object[]) });
+                if (debugLogFormat != null)
+                {
+                    anyTarget = true;
+                    Log.LogInfo($"SpectatorAttachTrace target: {debugLogFormat.DeclaringType?.FullName}.{debugLogFormat.Name}");
+                    yield return debugLogFormat;
+                }
+            }
+
+            var applicationType = AccessTools.TypeByName("UnityEngine.Application");
+            if (applicationType == null)
+            {
+                var withThreadFlag = AccessTools.DeclaredMethod(applicationType,
+                    "CallLogCallback",
+                    new[] { typeof(string), typeof(string), typeof(LogType), typeof(bool) });
+                if (withThreadFlag != null)
+                {
+                    anyTarget = true;
+                    Log.LogInfo($"SpectatorAttachTrace target: {withThreadFlag.DeclaringType?.FullName}.{withThreadFlag.Name} (4 args)");
+                    yield return withThreadFlag;
+                }
+
+                var withoutThreadFlag = AccessTools.DeclaredMethod(applicationType,
+                    "CallLogCallback",
+                    new[] { typeof(string), typeof(string), typeof(LogType) });
+                if (withoutThreadFlag != null)
+                {
+                    anyTarget = true;
+                    Log.LogInfo($"SpectatorAttachTrace target: {withoutThreadFlag.DeclaringType?.FullName}.{withoutThreadFlag.Name} (3 args)");
+                    yield return withoutThreadFlag;
+                }
+            }
+
+            var impossibleOddsLogType = AccessTools.TypeByName("ImpossibleOdds.Log");
+            if (impossibleOddsLogType != null)
+            {
+                foreach (var method in impossibleOddsLogType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+                {
+                    if (method.Name != "Error")
+                        continue;
+
+                    anyTarget = true;
+                    Log.LogInfo($"SpectatorAttachTrace target: {method.DeclaringType?.FullName}.{method}");
+                    yield return method;
+                }
+            }
+
+            if (!anyTarget)
+                Log.LogWarning("SpectatorAttachTrace: no logging targets were resolved at patch time.");
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(MethodBase __originalMethod, object[] __args)
+        {
+            var source = __originalMethod == null
+                ? "<unknown>"
+                : $"{__originalMethod.DeclaringType?.FullName}.{__originalMethod.Name}";
+            var logType = LogType.Log;
+            string message = null;
+            string callbackStack = null;
+
+            var declaringTypeName = __originalMethod?.DeclaringType?.FullName;
+            if (declaringTypeName == "UnityEngine.Application" && __args != null && __args.Length >= 3)
+            {
+                message = __args[0] as string;
+                callbackStack = __args[1] as string;
+                if (__args[2] is LogType callbackType)
+                    logType = callbackType;
+            }
+            else if (declaringTypeName == "UnityEngine.DebugLogHandler" && __args != null && __args.Length >= 4)
+            {
+                if (__args[0] is LogType handlerType)
+                    logType = handlerType;
+                message = BuildFormattedMessage(__args[2] as string, __args[3] as object[]);
+            }
+            else if (declaringTypeName == "ImpossibleOdds.Log")
+            {
+                logType = LogType.Error;
+                message = __args != null && __args.Length > 0 ? __args[0]?.ToString() : null;
+            }
+
+            TryLogSpectatorAttachTrace(source, logType, message, callbackStack);
+        }
+    }
+
+    private static string BuildFormattedMessage(string format, object[] args)
+    {
+        try
+        {
+            return args == null || args.Length == 0
+                ? format
+                : string.Format(format, args);
+        }
+        catch (System.Exception ex)
+        {
+            return $"{format} [format failed: {ex.Message}]";
+        }
+    }
+
+    private static void TryLogSpectatorAttachTrace(string source, LogType logType, string message, string originalStackTrace)
+    {
+        if (string.IsNullOrEmpty(message) || message.IndexOf(SpectatorAttachMarker, System.StringComparison.OrdinalIgnoreCase) < 0)
+            return;
+
+        OnDroneResetStart();
+        OnDroneResetDone();
+
+        var hit = Interlocked.Increment(ref _spectatorAttachTraceHits);
+        var managedStack = new StackTrace(true).ToString();
+        var unityStack = StackTraceUtility.ExtractStackTrace();
+
+        Log.LogWarning($"[SpectatorAttachTrace #{hit}] source={source}, logType={logType}, thread={Thread.CurrentThread.ManagedThreadId}");
+        Log.LogWarning($"[SpectatorAttachTrace #{hit}] message={message}");
+        if (!string.IsNullOrEmpty(originalStackTrace))
+            Log.LogWarning($"[SpectatorAttachTrace #{hit}] callback stack:\n{originalStackTrace}");
+        Log.LogWarning($"[SpectatorAttachTrace #{hit}] managed stack:\n{managedStack}");
+        if (!string.IsNullOrEmpty(unityStack))
+            Log.LogWarning($"[SpectatorAttachTrace #{hit}] unity stack:\n{unityStack}");
+    }
+
     // Drone-reset hooks were originally a Harmony patch on FlightManager.ResetDroneRoutine.
     // That coroutine still exists in the current Assembly-CSharp.dll but is dead code: the
     // refactored flight manager drives reset through Reset() / IDroneResetHandle and raises
@@ -180,6 +327,19 @@ public sealed class Plugin : BaseUnityPlugin
         // scene may run a different fixedDeltaTime than flight.
         Log.LogInfo(
             $"Physics step: fixedDeltaTime={Time.fixedDeltaTime:F5}s ({1f / Time.fixedDeltaTime:F1} Hz)");
+    }
+
+
+    private static bool IsSubclassOfGenericTypeDefinition(System.Type candidateType, System.Type genericTypeDefinition)
+    {
+        for (var current = candidateType; current != null && current != typeof(object); current = current.BaseType)
+        {
+            var currentType = current.IsGenericType ? current.GetGenericTypeDefinition() : current;
+            if (currentType == genericTypeDefinition)
+                return true;
+        }
+
+        return false;
     }
 
     private static void OnDroneResetStart()
